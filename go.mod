@@ -1,4 +1,4 @@
-module github.com/ory/x
+module github.com/MateusAmin/x
 
 replace github.com/gogo/protobuf => github.com/gogo/protobuf v1.3.2
 
