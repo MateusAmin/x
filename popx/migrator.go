@@ -302,7 +302,7 @@ func (m *Migrator) isolatedTransaction(ctx context.Context, direction string, fn
 
 	c := m.Connection.WithContext(ctx)
 	tx, dberr := c.Store.TransactionContextOptions(ctx, &sql.TxOptions{
-		Isolation: sql.LevelSerializable,
+		Isolation: sql.LevelRepeatableRead,
 		ReadOnly:  false,
 	})
 	if dberr != nil {
