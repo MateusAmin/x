@@ -300,6 +300,7 @@ func (m *Migrator) isolatedTransaction(ctx context.Context, direction string, fn
 		defer cancel()
 	}
 
+	// Lowered isolation level requirements
 	c := m.Connection.WithContext(ctx)
 	tx, dberr := c.Store.TransactionContextOptions(ctx, &sql.TxOptions{
 		Isolation: sql.LevelRepeatableRead,
