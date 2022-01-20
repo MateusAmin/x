@@ -1,6 +1,8 @@
 package configx
 
 import (
+	"strings"
+
 	"github.com/knadh/koanf/maps"
 	"github.com/pkg/errors"
 
@@ -9,16 +11,16 @@ import (
 )
 
 type KoanfSchemaDefaults struct {
-	c   *jsonschema.Compiler
-	uri string
+	keys []jsonschemax.Path
 }
 
-func NewKoanfSchemaDefaults(schema []byte) (*KoanfSchemaDefaults, error) {
-	id, c, err := newCompiler(schema)
+func NewKoanfSchemaDefaults(rawSchema []byte, schema *jsonschema.Schema) (*KoanfSchemaDefaults, error) {
+	keys, err := getSchemaPaths(rawSchema, schema)
 	if err != nil {
 		return nil, err
 	}
-	return &KoanfSchemaDefaults{c: c, uri: id}, nil
+
+	return &KoanfSchemaDefaults{keys: keys}, nil
 }
 
 func (k *KoanfSchemaDefaults) ReadBytes() ([]byte, error) {
@@ -26,13 +28,13 @@ func (k *KoanfSchemaDefaults) ReadBytes() ([]byte, error) {
 }
 
 func (k *KoanfSchemaDefaults) Read() (map[string]interface{}, error) {
-	keys, err := jsonschemax.ListPaths(k.uri, k.c)
-	if err != nil {
-		return nil, err
-	}
-
 	values := map[string]interface{}{}
-	for _, key := range keys {
+	for _, key := range k.keys {
+		// It's an array!
+		if strings.Contains(key.Name, "#") {
+			continue
+		}
+
 		if key.Default != nil {
 			values[key.Name] = key.Default
 		}

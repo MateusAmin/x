@@ -3,7 +3,6 @@ package sqlcon
 import (
 	"database/sql"
 	"net/http"
-	"strings"
 
 	"google.golang.org/grpc/codes"
 
@@ -13,8 +12,6 @@ import (
 	"github.com/pkg/errors"
 
 	"github.com/ory/herodot"
-
-	"github.com/ory/x/errorsx"
 )
 
 var (
@@ -39,7 +36,29 @@ var (
 		StatusField:   http.StatusText(http.StatusBadRequest),
 		ErrorField:    "Unable to serialize access due to a concurrent update in another session",
 	}
+	ErrNoSuchTable = &herodot.DefaultError{
+		CodeField:     http.StatusInternalServerError,
+		GRPCCodeField: codes.Internal,
+		StatusField:   http.StatusText(http.StatusInternalServerError),
+		ErrorField:    "Unable to locate the table",
+	}
 )
+
+func handlePostgres(err error, sqlState string) error {
+	switch sqlState {
+	case "23505": // "unique_violation"
+		return errors.Wrap(ErrUniqueViolation, err.Error())
+	case "40001": // "serialization_failure"
+		return errors.Wrap(ErrConcurrentUpdate, err.Error())
+	case "42P01": // "no such table"
+		return errors.Wrap(ErrNoSuchTable, err.Error())
+	}
+	return errors.WithStack(err)
+}
+
+type stater interface {
+	SQLState() string
+}
 
 // HandleError returns the right sqlcon.Err* depending on the input error.
 func HandleError(err error) error {
@@ -47,42 +66,26 @@ func HandleError(err error) error {
 		return nil
 	}
 
+	var st stater
 	if errors.Is(err, sql.ErrNoRows) {
 		return errors.WithStack(ErrNoRows)
-	}
-
-	switch e := errorsx.Cause(err).(type) {
-	case interface{ SQLState() string }:
-		switch e.SQLState() {
-		case "23505": // "unique_violation"
-			return errors.Wrap(ErrUniqueViolation, err.Error())
-		case "40001": // "serialization_failure"
-			return errors.Wrap(ErrConcurrentUpdate, err.Error())
-		}
-	case *pq.Error:
-		switch e.Code {
-		case "23505": // "unique_violation"
-			return errors.Wrap(ErrUniqueViolation, e.Error())
-		case "40001": // "serialization_failure"
-			return errors.Wrap(ErrConcurrentUpdate, e.Error())
-		}
-	case *mysql.MySQLError:
+	} else if errors.As(err, &st) {
+		return handlePostgres(err, st.SQLState())
+	} else if e := new(pq.Error); errors.As(err, &e) {
+		return handlePostgres(err, string(e.Code))
+	} else if e := new(pgconn.PgError); errors.As(err, &e) {
+		return handlePostgres(err, e.Code)
+	} else if e := new(mysql.MySQLError); errors.As(err, &e) {
 		switch e.Number {
 		case 1062:
 			return errors.Wrap(ErrUniqueViolation, err.Error())
-		}
-	case *pgconn.PgError:
-		switch e.Code {
-		case "23505": // "unique_violation"
-			return errors.Wrap(ErrUniqueViolation, e.Error())
-		case "40001": // "serialization_failure"
-			return errors.Wrap(ErrConcurrentUpdate, e.Error())
+		case 1146:
+			return errors.Wrap(ErrNoSuchTable, e.Error())
 		}
 	}
 
-	// Try other detections, for example for SQLite (we don't want to enforce CGO here!)
-	if strings.Contains(err.Error(), "UNIQUE constraint failed") {
-		return errors.Wrap(ErrUniqueViolation, err.Error())
+	if err := handleSqlite(err); err != nil {
+		return err
 	}
 
 	return errors.WithStack(err)

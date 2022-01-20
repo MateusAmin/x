@@ -90,13 +90,8 @@ func RegisterConfigFlag(flags *pflag.FlagSet, fallback []string) {
 // 2. Config files (yaml, yml, toml, json)
 // 3. Command line flags
 // 4. Environment variables
-func New(schema []byte, modifiers ...OptionModifier) (*Provider, error) {
-	schemaID, comp, err := newCompiler(schema)
-	if err != nil {
-		return nil, err
-	}
-
-	validator, err := comp.Compile(schemaID)
+func New(ctx context.Context, schema []byte, modifiers ...OptionModifier) (*Provider, error) {
+	validator, err := getSchema(ctx, schema)
 	if err != nil {
 		return nil, err
 	}
@@ -111,7 +106,7 @@ func New(schema []byte, modifiers ...OptionModifier) (*Provider, error) {
 		onValidationError:        func(k *koanf.Koanf, err error) {},
 		excludeFieldsFromTracing: []string{"dsn", "secret", "password", "key"},
 		logger:                   logrusx.New("discarding config logger", "", logrusx.UseLogger(l)),
-		Koanf:                    koanf.New(Delimiter),
+		Koanf:                    koanf.NewWithConf(koanf.Conf{Delim: Delimiter, StrictMerge: true}),
 	}
 
 	for _, m := range modifiers {
@@ -134,8 +129,12 @@ func New(schema []byte, modifiers ...OptionModifier) (*Provider, error) {
 	return p, nil
 }
 
+func (p *Provider) SkipValidation() bool {
+	return p.skipValidation
+}
+
 func (p *Provider) createProviders(ctx context.Context) (providers []koanf.Provider, err error) {
-	defaultsProvider, err := NewKoanfSchemaDefaults(p.schema)
+	defaultsProvider, err := NewKoanfSchemaDefaults(p.schema, p.validator)
 	if err != nil {
 		return nil, err
 	}
@@ -175,7 +174,7 @@ func (p *Provider) createProviders(ctx context.Context) (providers []koanf.Provi
 		providers = append(providers, posflag.Provider(p.flags, ".", p.Koanf))
 	}
 
-	envProvider, err := NewKoanfEnv("", p.schema)
+	envProvider, err := NewKoanfEnv("", p.schema, p.validator)
 	if err != nil {
 		return nil, err
 	}
@@ -229,7 +228,12 @@ func (p *Provider) newKoanf() (*koanf.Koanf, error) {
 			provider = posflag.Provider(p.flags, ".", k)
 		}
 
-		if err := k.Load(provider, nil); err != nil {
+		var opts []koanf.Option
+		if _, ok := provider.(*Env); ok {
+			opts = append(opts, koanf.WithMergeFunc(MergeAllTypes))
+		}
+
+		if err := k.Load(provider, nil, opts...); err != nil {
 			return nil, err
 		}
 	}
@@ -289,23 +293,29 @@ func (p *Provider) runOnChanges(e watcherx.Event, err error) {
 
 func (p *Provider) reload(e watcherx.Event) {
 	p.l.Lock()
-	defer p.l.Unlock()
+
+	var err error
+	defer func() {
+		// we first want to unlock and then runOnChanges, so that the callbacks can actually use the Provider
+		p.l.Unlock()
+		p.runOnChanges(e, err)
+	}()
 
 	nk, err := p.newKoanf()
 	if err != nil {
-		p.runOnChanges(e, err)
-		return
+		return // unlocks & runs changes in defer
 	}
 
 	for _, key := range p.immutables {
 		if !reflect.DeepEqual(p.Koanf.Get(key), nk.Get(key)) {
-			p.runOnChanges(e, NewImmutableError(key, fmt.Sprintf("%v", p.Koanf.Get(key)), fmt.Sprintf("%v", nk.Get(key))))
-			return
+			err = NewImmutableError(key, fmt.Sprintf("%v", p.Koanf.Get(key)), fmt.Sprintf("%v", nk.Get(key)))
+			return // unlocks & runs changes in defer
 		}
 	}
 
 	p.replaceKoanf(nk)
-	p.runOnChanges(e, nil)
+
+	// unlocks & runs changes in defer
 }
 
 func (p *Provider) watchForFileChanges(c watcherx.EventChannel) {
@@ -462,19 +472,23 @@ func (p *Provider) TracingConfig(serviceName string) *tracing.Config {
 	return &tracing.Config{
 		ServiceName: p.StringF("tracing.service_name", serviceName),
 		Provider:    p.String("tracing.provider"),
-		Jaeger: &tracing.JaegerConfig{
-			LocalAgentHostPort: p.String("tracing.providers.jaeger.local_agent_address"),
-			SamplerType:        p.StringF("tracing.providers.jaeger.sampling.type", "const"),
-			SamplerValue:       p.Float64F("tracing.providers.jaeger.sampling.value", float64(1)),
-			SamplerServerURL:   p.String("tracing.providers.jaeger.sampling.server_url"),
-			MaxTagValueLength:  p.IntF("tracing.providers.jaeger.max_tag_value_length", jaeger.DefaultMaxTagValueLength),
-			Propagation: stringsx.Coalesce(
-				os.Getenv("JAEGER_PROPAGATION"),
-				p.String("tracing.providers.jaeger.propagation"),
-			),
-		},
-		Zipkin: &tracing.ZipkinConfig{
-			ServerURL: p.String("tracing.providers.zipkin.server_url"),
+		Providers: &tracing.ProvidersConfig{
+			Jaeger: &tracing.JaegerConfig{
+				Sampling: &tracing.JaegerSampling{
+					Type:      p.StringF("tracing.providers.jaeger.sampling.type", "const"),
+					Value:     p.Float64F("tracing.providers.jaeger.sampling.value", float64(1)),
+					ServerURL: p.String("tracing.providers.jaeger.sampling.server_url"),
+				},
+				LocalAgentAddress: p.String("tracing.providers.jaeger.local_agent_address"),
+				MaxTagValueLength: p.IntF("tracing.providers.jaeger.max_tag_value_length", jaeger.DefaultMaxTagValueLength),
+				Propagation: stringsx.Coalesce(
+					os.Getenv("JAEGER_PROPAGATION"),
+					p.String("tracing.providers.jaeger.propagation"),
+				),
+			},
+			Zipkin: &tracing.ZipkinConfig{
+				ServerURL: p.String("tracing.providers.zipkin.server_url"),
+			},
 		},
 	}
 }

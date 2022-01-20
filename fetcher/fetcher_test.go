@@ -3,6 +3,7 @@ package fetcher
 import (
 	"encoding/base64"
 	"fmt"
+	"github.com/ory/x/httpx"
 	"io/ioutil"
 	"net/http"
 	"os"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/gobuffalo/httptest"
 	"github.com/julienschmidt/httprouter"
+	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -30,7 +32,7 @@ func TestFetcher(t *testing.T) {
 	require.NoError(t, file.Close())
 
 	for fc, fetcher := range []*Fetcher{
-		NewFetcher(WithClient(ts.Client())),
+		NewFetcher(WithClient(httpx.NewResilientClient(httpx.ResilientClientWithClient(ts.Client())))),
 		NewFetcher(),
 	} {
 		for k, tc := range []struct {
@@ -57,4 +59,12 @@ func TestFetcher(t *testing.T) {
 			})
 		}
 	}
+
+	t.Run("case=returns proper error on unknown scheme", func(t *testing.T) {
+		_, err := NewFetcher().Fetch("unknown-scheme://foo")
+		require.NotNil(t, err)
+
+		assert.True(t, errors.Is(err, ErrUnknownScheme))
+		assert.Contains(t, err.Error(), "unknown-scheme")
+	})
 }

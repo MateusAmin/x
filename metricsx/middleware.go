@@ -21,16 +21,24 @@
 package metricsx
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ory/x/httpx"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/status"
 
 	"github.com/ory/x/configx"
 
@@ -41,7 +49,6 @@ import (
 	"github.com/ory/x/resilience"
 
 	"github.com/pborman/uuid"
-	"github.com/urfave/negroni"
 
 	analytics "github.com/ory/analytics-go/v4"
 )
@@ -171,6 +178,18 @@ func New(
 	}
 
 	if !optOut {
+		optOut = c.Bool("sqa_opt_out")
+	}
+
+	if !optOut {
+		optOut, _ = strconv.ParseBool(os.Getenv("SQA_OPT_OUT"))
+	}
+
+	if !optOut {
+		optOut, _ = strconv.ParseBool(os.Getenv("SQA-OPT-OUT"))
+	}
+
+	if !optOut {
 		l.Info("Software quality assurance features are enabled. Learn more at: https://www.ory.sh/docs/ecosystem/sqa")
 		oi = analytics.OSInfo{
 			Version: fmt.Sprintf("%s-%s", runtime.GOOS, runtime.GOARCH),
@@ -241,6 +260,11 @@ func (sw *Service) ObserveMemory() {
 	}
 }
 
+type negroniMiddleware interface {
+	Size() int
+	Status() int
+}
+
 // ServeHTTP is a middleware for sending meta information to segment.
 func (sw *Service) ServeHTTP(rw http.ResponseWriter, r *http.Request, next http.HandlerFunc) {
 	var start time.Time
@@ -254,7 +278,7 @@ func (sw *Service) ServeHTTP(rw http.ResponseWriter, r *http.Request, next http.
 		return
 	}
 
-	latency := time.Now().UTC().Sub(start.UTC()) / time.Millisecond
+	latency := time.Since(start) / time.Millisecond
 
 	scheme := "https:"
 	if r.TLS == nil {
@@ -265,9 +289,7 @@ func (sw *Service) ServeHTTP(rw http.ResponseWriter, r *http.Request, next http.
 	query := sw.anonymizeQuery(r.URL.Query(), sw.salt)
 
 	// Collecting request info
-	res := rw.(negroni.ResponseWriter)
-	status := res.Status()
-	size := res.Size()
+	stat, size := httpx.GetResponseMeta(rw)
 
 	if err := sw.c.Enqueue(analytics.Page{
 		UserId: sw.o.ClusterID,
@@ -277,7 +299,7 @@ func (sw *Service) ServeHTTP(rw http.ResponseWriter, r *http.Request, next http.
 			SetURL(scheme+"//"+sw.o.ClusterID+path+"?"+query).
 			SetPath(path).
 			SetName(path).
-			Set("status", status).
+			Set("status", stat).
 			Set("size", size).
 			Set("latency", latency).
 			Set("method", r.Method),
@@ -286,6 +308,45 @@ func (sw *Service) ServeHTTP(rw http.ResponseWriter, r *http.Request, next http.
 		sw.l.WithError(err).Debug("Could not commit anonymized telemetry data")
 		// do nothing...
 	}
+}
+
+func (sw *Service) UnaryInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+	var start time.Time
+	if !sw.optOut {
+		start = time.Now()
+	}
+
+	resp, err := handler(ctx, req)
+
+	if sw.optOut {
+		return resp, err
+	}
+
+	latency := time.Since(start) / time.Millisecond
+
+	if err := sw.c.Enqueue(analytics.Page{
+		UserId: sw.o.ClusterID,
+		Name:   info.FullMethod,
+		Properties: analytics.
+			NewProperties().
+			SetURL("grpc://"+sw.o.ClusterID+info.FullMethod).
+			SetPath(info.FullMethod).
+			SetName(info.FullMethod).
+			Set("status", status.Code(err)).
+			Set("latency", latency),
+		Context: sw.context,
+	}); err != nil {
+		sw.l.WithError(err).Debug("Could not commit anonymized telemetry data")
+		// do nothing...
+	}
+
+	return resp, err
+}
+
+func (sw *Service) StreamInterceptor(srv interface{}, stream grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+	// this needs a bit of thought, but we don't have streaming RPCs currently anyway
+	sw.l.Info("The telemetry stream interceptor is not yet implemented!")
+	return handler(srv, stream)
 }
 
 func (sw *Service) Close() error {
@@ -298,9 +359,9 @@ func (sw *Service) anonymizePath(path string, salt string) string {
 
 	for _, p := range paths {
 		p = strings.ToLower(p)
-		if len(path) == len(p) && path[:len(p)] == strings.ToLower(p) {
+		if path == p {
 			return p
-		} else if len(path) > len(p) && path[:len(p)+1] == strings.ToLower(p)+"/" {
+		} else if strings.HasPrefix(path, p) {
 			return path[:len(p)] + "/" + Hash(path[len(p):]+"|"+salt)
 		}
 	}

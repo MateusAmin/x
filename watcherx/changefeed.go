@@ -29,15 +29,26 @@ func NewChangeFeedConnection(ctx context.Context, l *logrusx.Logger, dsn string)
 
 	_, _, _, _, cleanedDSN := sqlcon.ParseConnectionOptions(l, dsn)
 	cleanedDSN = strings.Replace(dsn, "cockroach://", "postgres://", 1)
+	l.WithField("component", "github.com/ory/x/watcherx.NewChangeFeedConnection").Info("Opening watcherx database connection.")
 	cx, err := sqlx.Open("pgx", cleanedDSN)
 	if err != nil {
 		return nil, err
 	}
 
+	l.WithField("component", "github.com/ory/x/watcherx.NewChangeFeedConnection").Info("Connection to watcherx database is open.")
+
 	cx.SetMaxIdleConns(1)
 	cx.SetMaxOpenConns(1)
 	cx.SetConnMaxLifetime(-1)
 	cx.SetConnMaxIdleTime(-1)
+
+	l.WithField("component", "github.com/ory/x/watcherx.NewChangeFeedConnection").Info("Trying to ping the watcherx database connection.")
+
+	if err := cx.PingContext(ctx); err != nil {
+		return nil, err
+	}
+
+	l.WithField("component", "github.com/ory/x/watcherx.NewChangeFeedConnection").Info("Enabling CHANGEFEED on watcherx database connection.")
 
 	// Ensure CHANGEFEED is enabled
 	_, err = cx.ExecContext(ctx, "SET CLUSTER SETTING kv.rangefeed.enabled = true")
@@ -45,9 +56,7 @@ func NewChangeFeedConnection(ctx context.Context, l *logrusx.Logger, dsn string)
 		return nil, errors.WithStack(err)
 	}
 
-	if err := cx.PingContext(ctx); err != nil {
-		return nil, err
-	}
+	l.WithField("component", "github.com/ory/x/watcherx.NewChangeFeedConnection").Info("Initialization of CHANGEFEED is done.")
 
 	return cx, nil
 }
@@ -71,8 +80,6 @@ func WatchChangeFeed(ctx context.Context, cx *sqlx.DB, tableName string, c Event
 			return nil, errors.WithStack(err)
 		}
 	}
-
-	fmt.Printf("\n\n\n NEXT %s \n\n\n", tableName)
 
 	d := newDispatcher()
 
@@ -142,17 +149,14 @@ func WatchChangeFeed(ctx context.Context, cx *sqlx.DB, tableName string, c Event
 			close(done)
 		}
 
-		// We need to execute this without a context or else this will fail because the parent context was already canceled.
-		//
-		// See also https://www.cockroachlabs.com/docs/v21.1/changefeed-for#considerations
-		if _, err = cx.Exec("CANCEL QUERY (SELECT query_id FROM [SHOW CLUSTER QUERIES] WHERE query LIKE 'EXPERIMENTAL CHANGEFEED %')"); err != nil {
+		if err := rows.Close(); err != nil {
 			c <- &ErrorEvent{
 				error: err,
 			}
 			return
 		}
 
-		if err := rows.Close(); err != nil {
+		if err := cx.Close(); err != nil {
 			c <- &ErrorEvent{
 				error: err,
 			}

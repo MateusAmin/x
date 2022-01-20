@@ -2,6 +2,7 @@ package jsonschemax
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -84,6 +85,9 @@ type Path struct {
 	MinLength int
 	MaxLength int
 
+	// Required if set indicates this field is required.
+	Required bool
+
 	Minimum *big.Float
 	Maximum *big.Float
 
@@ -93,7 +97,7 @@ type Path struct {
 }
 
 // ListPathsBytes works like ListPathsWithRecursion but prepares the JSON Schema itself.
-func ListPathsBytes(raw json.RawMessage, maxRecursion int16) ([]Path, error) {
+func ListPathsBytes(ctx context.Context, raw json.RawMessage, maxRecursion int16) ([]Path, error) {
 	compiler := jsonschema.NewCompiler()
 	compiler.ExtractAnnotations = true
 	id := fmt.Sprintf("%x.json", sha256.Sum256(raw))
@@ -101,35 +105,61 @@ func ListPathsBytes(raw json.RawMessage, maxRecursion int16) ([]Path, error) {
 		return nil, err
 	}
 	compiler.ExtractAnnotations = true
-	return runPaths(id, compiler, maxRecursion)
+	return runPathsFromCompiler(ctx, id, compiler, maxRecursion, false)
 }
 
 // ListPathsWithRecursion will follow circular references until maxRecursion is reached, without
 // returning an error.
-func ListPathsWithRecursion(ref string, compiler *jsonschema.Compiler, maxRecursion uint8) ([]Path, error) {
-	return runPaths(ref, compiler, int16(maxRecursion))
+func ListPathsWithRecursion(ctx context.Context, ref string, compiler *jsonschema.Compiler, maxRecursion uint8) ([]Path, error) {
+	return runPathsFromCompiler(ctx, ref, compiler, int16(maxRecursion), false)
 }
 
 // ListPaths lists all paths of a JSON Schema. Will return an error
 // if circular references are found.
-func ListPaths(ref string, compiler *jsonschema.Compiler) ([]Path, error) {
-	return runPaths(ref, compiler, -1)
+func ListPaths(ctx context.Context, ref string, compiler *jsonschema.Compiler) ([]Path, error) {
+	return runPathsFromCompiler(ctx, ref, compiler, -1, false)
 }
 
-func runPaths(ref string, compiler *jsonschema.Compiler, maxRecursion int16) ([]Path, error) {
+// ListPathsWithArraysIncluded lists all paths of a JSON Schema. Will return an error
+// if circular references are found.
+// Includes arrays with `#`.
+func ListPathsWithArraysIncluded(ctx context.Context, ref string, compiler *jsonschema.Compiler) ([]Path, error) {
+	return runPathsFromCompiler(ctx, ref, compiler, -1, true)
+}
+
+// ListPathsWithInitializedSchema loads the paths from the schema without compiling it.
+//
+// You MUST ensure that the compiler was using `ExtractAnnotations = true`.
+func ListPathsWithInitializedSchema(schema *jsonschema.Schema) ([]Path, error) {
+	return runPaths(schema, -1, false)
+}
+
+// ListPathsWithInitializedSchemaAndArraysIncluded loads the paths from the schema without compiling it.
+//
+// You MUST ensure that the compiler was using `ExtractAnnotations = true`.
+// Includes arrays with `#`.
+func ListPathsWithInitializedSchemaAndArraysIncluded(schema *jsonschema.Schema) ([]Path, error) {
+	return runPaths(schema, -1, true)
+}
+
+func runPathsFromCompiler(ctx context.Context, ref string, compiler *jsonschema.Compiler, maxRecursion int16, includeArrays bool) ([]Path, error) {
 	if compiler == nil {
 		compiler = jsonschema.NewCompiler()
 	}
 
 	compiler.ExtractAnnotations = true
-	pointers := map[string]bool{}
 
-	schema, err := compiler.Compile(ref)
+	schema, err := compiler.Compile(ctx, ref)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
 
-	paths, err := listPaths(schema, nil, pointers, 0, maxRecursion)
+	return runPaths(schema, maxRecursion, includeArrays)
+}
+
+func runPaths(schema *jsonschema.Schema, maxRecursion int16, includeArrays bool) ([]Path, error) {
+	pointers := map[string]bool{}
+	paths, err := listPaths(schema, nil, nil, pointers, 0, maxRecursion, includeArrays)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -177,7 +207,7 @@ func appendPointer(in map[string]bool, pointer *jsonschema.Schema) map[string]bo
 	return out
 }
 
-func listPaths(schema *jsonschema.Schema, parents []string, pointers map[string]bool, currentRecursion int16, maxRecursion int16) (byName, error) {
+func listPaths(schema *jsonschema.Schema, parent *jsonschema.Schema, parents []string, pointers map[string]bool, currentRecursion int16, maxRecursion int16, includeArrays bool) (byName, error) {
 	var pathType interface{}
 	var pathTypeHint TypeHint
 	var paths []Path
@@ -269,7 +299,19 @@ func listPaths(schema *jsonschema.Schema, parents []string, pointers map[string]
 	if v, ok := def.(json.Number); ok {
 		def, _ = v.Float64()
 	}
+
 	if (pathType != nil || schema.Default != nil) && len(parents) > 0 {
+		name := parents[len(parents)-1]
+		var required bool
+		if parent != nil {
+			for _, r := range parent.Required {
+				if r == name {
+					required = true
+					break
+				}
+			}
+		}
+
 		path := Path{
 			Name:        strings.Join(parents, "."),
 			Default:     def,
@@ -288,7 +330,9 @@ func listPaths(schema *jsonschema.Schema, parents []string, pointers map[string]
 			Title:       schema.Title,
 			Description: schema.Description,
 			Examples:    schema.Examples,
+			Required:    required,
 		}
+
 		for _, e := range schema.Extensions {
 			if enhancer, ok := e.(PathEnhancer); ok {
 				path.CustomProperties = enhancer.EnhancePath(path)
@@ -307,7 +351,7 @@ func listPaths(schema *jsonschema.Schema, parents []string, pointers map[string]
 	}
 
 	if schema.Ref != nil {
-		path, err := listPaths(schema.Ref, parents, appendPointer(pointers, schema), currentRecursion, maxRecursion)
+		path, err := listPaths(schema.Ref, schema, parents, appendPointer(pointers, schema), currentRecursion, maxRecursion, includeArrays)
 		if err != nil {
 			return nil, err
 		}
@@ -315,7 +359,7 @@ func listPaths(schema *jsonschema.Schema, parents []string, pointers map[string]
 	}
 
 	if schema.Not != nil {
-		path, err := listPaths(schema.Not, parents, appendPointer(pointers, schema), currentRecursion, maxRecursion)
+		path, err := listPaths(schema.Not, schema, parents, appendPointer(pointers, schema), currentRecursion, maxRecursion, includeArrays)
 		if err != nil {
 			return nil, err
 		}
@@ -323,7 +367,7 @@ func listPaths(schema *jsonschema.Schema, parents []string, pointers map[string]
 	}
 
 	if schema.If != nil {
-		path, err := listPaths(schema.If, parents, appendPointer(pointers, schema), currentRecursion, maxRecursion)
+		path, err := listPaths(schema.If, schema, parents, appendPointer(pointers, schema), currentRecursion, maxRecursion, includeArrays)
 		if err != nil {
 			return nil, err
 		}
@@ -331,7 +375,7 @@ func listPaths(schema *jsonschema.Schema, parents []string, pointers map[string]
 	}
 
 	if schema.Then != nil {
-		path, err := listPaths(schema.Then, parents, appendPointer(pointers, schema), currentRecursion, maxRecursion)
+		path, err := listPaths(schema.Then, schema, parents, appendPointer(pointers, schema), currentRecursion, maxRecursion, includeArrays)
 		if err != nil {
 			return nil, err
 		}
@@ -339,7 +383,7 @@ func listPaths(schema *jsonschema.Schema, parents []string, pointers map[string]
 	}
 
 	if schema.Else != nil {
-		path, err := listPaths(schema.Else, parents, appendPointer(pointers, schema), currentRecursion, maxRecursion)
+		path, err := listPaths(schema.Else, schema, parents, appendPointer(pointers, schema), currentRecursion, maxRecursion, includeArrays)
 		if err != nil {
 			return nil, err
 		}
@@ -347,7 +391,7 @@ func listPaths(schema *jsonschema.Schema, parents []string, pointers map[string]
 	}
 
 	for _, sub := range schema.AllOf {
-		path, err := listPaths(sub, parents, appendPointer(pointers, schema), currentRecursion, maxRecursion)
+		path, err := listPaths(sub, schema, parents, appendPointer(pointers, schema), currentRecursion, maxRecursion, includeArrays)
 		if err != nil {
 			return nil, err
 		}
@@ -355,7 +399,7 @@ func listPaths(schema *jsonschema.Schema, parents []string, pointers map[string]
 	}
 
 	for _, sub := range schema.AnyOf {
-		path, err := listPaths(sub, parents, appendPointer(pointers, schema), currentRecursion, maxRecursion)
+		path, err := listPaths(sub, schema, parents, appendPointer(pointers, schema), currentRecursion, maxRecursion, includeArrays)
 		if err != nil {
 			return nil, err
 		}
@@ -363,7 +407,7 @@ func listPaths(schema *jsonschema.Schema, parents []string, pointers map[string]
 	}
 
 	for _, sub := range schema.OneOf {
-		path, err := listPaths(sub, parents, appendPointer(pointers, schema), currentRecursion, maxRecursion)
+		path, err := listPaths(sub, schema, parents, appendPointer(pointers, schema), currentRecursion, maxRecursion, includeArrays)
 		if err != nil {
 			return nil, err
 		}
@@ -371,11 +415,30 @@ func listPaths(schema *jsonschema.Schema, parents []string, pointers map[string]
 	}
 
 	for name, sub := range schema.Properties {
-		path, err := listPaths(sub, append(parents, name), appendPointer(pointers, schema), currentRecursion, maxRecursion)
+		path, err := listPaths(sub, schema, append(parents, name), appendPointer(pointers, schema), currentRecursion, maxRecursion, includeArrays)
 		if err != nil {
 			return nil, err
 		}
 		paths = append(paths, path...)
+	}
+
+	if schema.Items != nil && includeArrays {
+		switch t := schema.Items.(type) {
+		case []*jsonschema.Schema:
+			for _, sub := range t {
+				path, err := listPaths(sub, schema, append(parents, "#"), appendPointer(pointers, schema), currentRecursion, maxRecursion, includeArrays)
+				if err != nil {
+					return nil, err
+				}
+				paths = append(paths, path...)
+			}
+		case *jsonschema.Schema:
+			path, err := listPaths(t, schema, append(parents, "#"), appendPointer(pointers, schema), currentRecursion, maxRecursion, includeArrays)
+			if err != nil {
+				return nil, err
+			}
+			paths = append(paths, path...)
+		}
 	}
 
 	return paths, nil

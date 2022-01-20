@@ -8,7 +8,7 @@ import (
 	"reflect"
 	"strings"
 
-	"github.com/gobuffalo/pop/v5/logging"
+	"github.com/gobuffalo/pop/v6/logging"
 
 	"github.com/sirupsen/logrus"
 
@@ -48,25 +48,31 @@ func (l *Logger) WithContext(ctx context.Context) *Logger {
 	return &ll
 }
 
-func (l *Logger) WithRequest(r *http.Request) *Logger {
+func (l *Logger) HTTPHeadersRedacted(h http.Header) map[string]interface{} {
 	headers := map[string]interface{}{}
-	if ua := r.UserAgent(); len(ua) > 0 {
-		headers["user-agent"] = ua
-	}
-
-	if cookie := l.maybeRedact(r.Header.Get("Cookie")); cookie != nil {
+	if cookie := l.maybeRedact(h.Get("Cookie")); cookie != nil {
 		headers["cookie"] = cookie
 	}
 
-	if auth := l.maybeRedact(r.Header.Get("Authorization")); auth != nil {
+	if auth := l.maybeRedact(h.Get("Authorization")); auth != nil {
 		headers["authorization"] = auth
 	}
 
-	for _, key := range []string{"Referer", "Origin", "Accept", "X-Request-ID", "If-None-Match",
-		"X-Forwarded-For", "X-Forwarded-Proto", "Cache-Control", "Accept-Encoding", "Accept-Language", "If-Modified-Since"} {
-		if value := r.Header.Get(key); len(value) > 0 {
-			headers[strings.ToLower(key)] = value
+	for key := range h {
+		if strings.ToLower(key) == "cookie" ||
+			strings.ToLower(key) == "authorization" {
+			continue
 		}
+		headers[strings.ToLower(key)] = h.Get(key)
+	}
+
+	return headers
+}
+
+func (l *Logger) WithRequest(r *http.Request) *Logger {
+	headers := l.HTTPHeadersRedacted(r.Header)
+	if ua := r.UserAgent(); len(ua) > 0 {
+		headers["user-agent"] = ua
 	}
 
 	scheme := "https"
@@ -125,12 +131,16 @@ func (l *Logger) WithSensitiveField(key string, value interface{}) *Logger {
 }
 
 func (l *Logger) WithError(err error) *Logger {
+	if err == nil {
+		return l
+	}
+
 	ctx := map[string]interface{}{"message": err.Error()}
-	if l.Entry.Logger.IsLevelEnabled(logrus.TraceLevel) {
+	if l.Entry.Logger.IsLevelEnabled(logrus.DebugLevel) {
 		if e, ok := err.(errorsx.StackTracer); ok {
-			ctx["trace"] = fmt.Sprintf("%+v", e.StackTrace())
+			ctx["stack_trace"] = fmt.Sprintf("%+v", e.StackTrace())
 		} else {
-			ctx["trace"] = fmt.Sprintf("stack trace could not be recovered from error type %s", reflect.TypeOf(err))
+			ctx["stack_trace"] = fmt.Sprintf("stack trace could not be recovered from error type %s", reflect.TypeOf(err))
 		}
 	}
 	if c := errorsx.ReasonCarrier(nil); errors.As(err, &c) {

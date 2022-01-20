@@ -2,6 +2,7 @@ package decoderx
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +12,8 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/ory/x/assertx"
+
 	"github.com/tidwall/gjson"
 
 	"github.com/pkg/errors"
@@ -19,6 +22,8 @@ import (
 
 	"github.com/ory/jsonschema/v3"
 )
+
+var ctx = context.Background()
 
 func newRequest(t *testing.T, method, url string, body io.Reader, ct string) *http.Request {
 	req := httptest.NewRequest(method, url, body)
@@ -146,6 +151,29 @@ func TestHTTPFormDecoder(t *testing.T) {
 }`,
 		},
 		{
+			d: "should mark the correct fields when nested objects are required",
+			request: newRequest(t, "POST", "/", bytes.NewBufferString(url.Values{
+				// newsletter represents a special case for checkbox input with true/false and raw HTML.
+				"foo": {"bar"},
+			}.Encode()), httpContentTypeURLEncodedForm),
+			options: []HTTPDecoderOption{
+				HTTPJSONSchemaCompiler("stub/consent.json", nil),
+				HTTPKeepRequestBody(true),
+				HTTPDecoderSetValidatePayloads(false),
+				HTTPDecoderUseQueryAndBody(),
+				HTTPDecoderAllowedMethods("POST", "GET"),
+				HTTPDecoderJSONFollowsFormFormat(),
+			},
+			expected: `{
+  "traits": {
+	"consent": {
+	  "inner": {}
+    },
+	"notrequired": {}
+  }
+}`,
+		},
+		{
 			d: "should pass form request with payload in query and type assert data",
 			request: newRequest(t, "POST", "/?age=29", bytes.NewBufferString(url.Values{
 				"name.first": {"Aeneas"},
@@ -190,6 +218,29 @@ func TestHTTPFormDecoder(t *testing.T) {
 	"consent": true,
 	"ratio": 0.9
 }`,
+		},
+		{
+			d: "should fail form request if empty values are sent because of required fields",
+			request: newRequest(t, "POST", "/?age=29", bytes.NewBufferString(url.Values{
+				"name.first":  {""},
+				"name.last":   {""},
+				"name2.first": {""},
+				"name2.last":  {""},
+				"ratio":       {""},
+				"ratio2":      {""},
+				"age":         {""},
+				"age2":        {""},
+				"consent":     {""},
+				"consent2":    {""},
+				// newsletter represents a special case for checkbox input with true/false and raw HTML.
+				"newsletter":  {""},
+				"newsletter2": {""},
+			}.Encode()), httpContentTypeURLEncodedForm),
+			options: []HTTPDecoderOption{
+				HTTPDecoderUseQueryAndBody(),
+				HTTPJSONSchemaCompiler("stub/required-defaults.json", nil),
+			},
+			expectedError: `I[#/name2] S[#/properties/name2/required] missing properties: "first"`,
 		},
 		{
 			d:             "should fail json request formatted as form if payload is invalid",
@@ -374,7 +425,7 @@ func TestHTTPFormDecoder(t *testing.T) {
 			}
 
 			require.NoError(t, err)
-			assert.JSONEq(t, tc.expected, string(destination))
+			assertx.EqualAsJSON(t, json.RawMessage(tc.expected), destination)
 		})
 	}
 

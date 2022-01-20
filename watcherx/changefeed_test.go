@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach-go/v2/testserver"
 	"github.com/google/uuid"
 	_ "github.com/jackc/pgx/v4/stdlib"
 	"github.com/stretchr/testify/assert"
@@ -15,7 +16,6 @@ import (
 	"github.com/tidwall/gjson"
 
 	"github.com/ory/x/logrusx"
-	"github.com/ory/x/sqlcon/dockertest"
 )
 
 // Run this test with
@@ -31,7 +31,12 @@ func TestChangeFeed(t *testing.T) {
 
 	ctx := context.Background()
 	l := logrusx.New("", "")
-	dsn := dockertest.RunTestCockroachDB(t)
+	db, err := testserver.NewTestServer()
+	require.NoError(t, err)
+
+	dsnp := db.PGURL()
+	dsnp.Scheme = "cockroach"
+	dsn := dsnp.String()
 
 	cx, err := NewChangeFeedConnection(ctx, l, dsn)
 	require.NoError(t, err)
@@ -71,8 +76,6 @@ func TestChangeFeed(t *testing.T) {
 	}, itemCount)
 
 	go func() {
-		defer close(events)
-
 		for k := range rowsToCreate {
 			c := rowsToCreate[k]
 			c.id = uuid.New().String()
@@ -98,9 +101,18 @@ func TestChangeFeed(t *testing.T) {
 	}()
 
 	var received []Event
-	for row := range events {
-		t.Logf("%+v", row)
-		received = append(received, row)
+	done := false
+	for !done {
+		select {
+		case <-time.After(time.Second * 2):
+			done = true
+		case row, ok := <-events:
+			if !ok {
+				done = true
+			}
+			t.Logf("%+v", row)
+			received = append(received, row)
+		}
 	}
 
 	expectedEventCount := watcherCount * itemCount * 3 // 3 operations: insert, update, delete

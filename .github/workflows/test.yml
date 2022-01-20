@@ -13,6 +13,9 @@ jobs:
     name: Run Tests on Windows
     runs-on: windows-latest
     steps:
+      - run: |
+          git config --system core.autocrlf false
+          git config --system core.eol lf
       - uses: actions/checkout@v2
       - uses: actions/setup-go@v2
         with:
@@ -53,15 +56,16 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v2
         with:
-          version: v1.41.0
+          version: v1.41.1
           skip-go-installation: true
+          args: --timeout 2m
       - name: Install cockroach DB
         run: |
           curl https://binaries.cockroachdb.com/cockroach-v21.1.2.linux-amd64.tgz | tar -xz
           sudo cp -i cockroach-v21.1.2.linux-amd64/cockroach /usr/local/bin/
           rm -rf cockroach-v21.1.2.linux-amd64
       - name: Prepare nancy dependency list
-        run: go list -json -m all > go.list
+        run: go list -json -deps > go.list
       - name: Run nancy
         uses: sonatype-nexus-community/nancy-github-action@main
       - run: make .bin/go-acc .bin/gcov2lcov
